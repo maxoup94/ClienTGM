@@ -1,0 +1,725 @@
+package org.FileExplorerM;
+
+import static org.FileExplorerM.FileExplorerM.actionCreateText;
+import static org.FileExplorerM.FileExplorerM.actionRefresh;
+import static org.FileExplorerM.FileExplorerM.adapter;
+import static org.FileExplorerM.FileExplorerM.cheminCourant;
+import static org.FileExplorerM.FileExplorerM.hideFile;
+import static org.FileExplorerM.FileExplorerM.openFileLauncher;
+import static org.FileExplorerM.FileExplorerM.pathTextView;
+import static org.FileExplorerM.FileExplorerM.progress;
+import static org.FileExplorerM.FileExplorerM.progressText;
+import static org.FileExplorerM.FileExplorerM.fileInfoList;
+import static org.FileExplorerM.FileExplorerM.sortFileInfo;
+import static org.FileExplorerM.FileExplorerM.tmpFileName;
+import static org.FileExplorerM.classUtils.getPathName;
+
+import com.jcraft.jsch.*;
+
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.view.View;
+
+import android.content.Context;
+
+import androidx.core.content.FileProvider;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.FileInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.Vector;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class SFTPConnection {
+
+    private static final String CHEMIN_HOME_DEFAUT = "/";
+    private static final String FICHIER_DISTANT_DEFAUT = "/";
+    private static final String FICHIER_LOCAL_DEFAUT = "/";
+
+    private static String host;
+    private static int port;
+    private static String user;
+    private static String password;
+    private static Session session;
+    public static ChannelSftp sftpChannel;
+    static Handler handler = new Handler(Looper.getMainLooper());
+
+    public SFTPConnection(String host, int port, String user, String password) {
+        Log.d("TAAG", "SFTPConnection" + host);
+        this.host = host;
+        this.port = port;
+        this.user = user;
+        this.password = password;
+    }
+
+    private static void initSession(Context context) throws JSchException {
+        Log.d("TAAG", "SFTP initSession");
+        JSch jsch = new JSch();
+        session = jsch.getSession(user, host, port);
+        session.setPassword(password);
+        session.setConfig("StrictHostKeyChecking", "no");
+        session.connect();
+        sftpChannel = (ChannelSftp) session.openChannel("sftp");
+        sftpChannel.connect();
+        Log.d("TAAG", "SFTP initSession connect");
+    }
+
+    public static void closeSession() {
+        if (sftpChannel != null) {
+            sftpChannel.disconnect();
+        }
+        if (session != null) {
+            session.disconnect();
+        }
+    }
+
+    public void Back() {
+        File file = new File(cheminCourant.substring(cheminCourant.indexOf(":") + 1));
+        cheminCourant = "sftp:" + file.getParent();
+    }
+
+
+    public static void Delete(final String remoteFilePath, final Context context) {
+        Log.d("TAAG", "deleteFile " + remoteFilePath);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Handler handler = new Handler(Looper.getMainLooper());
+        final boolean[] status = {false};
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                progress.setVisibility(View.VISIBLE);
+                progressText.setText("Deleting...");
+            }
+        });
+
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    initSession(context);
+                    // Check if the path is a file or directory
+                    SftpATTRS attrs = sftpChannel.stat(remoteFilePath);
+                    if (attrs.isDir()) {
+                        deleteDirectory(sftpChannel, remoteFilePath);
+                        status[0] = true;
+                    } else if (attrs.isReg()) {
+                        sftpChannel.rm(remoteFilePath);
+                        status[0] = true;
+                    } else {
+                        System.out.println(remoteFilePath + " is neither a regular file nor a directory.");
+                    }
+
+
+                } catch (Exception e) {
+                    Log.e("TAAG", "SFTPDelete Failed to delete: " + e.getMessage());
+
+                } finally {
+                    closeSession();
+                }
+                ListFiles(context);
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        progress.setVisibility(View.GONE);
+                        progressText.setText("");
+                        if (status[0]) {
+                            Log.d("TAAG", "SFTPDelete File deletion completed");
+                        } else {
+                            classUtils.messageDialog("ALERT", "Deleting Error " + remoteFilePath, context);
+                        }
+
+                    }
+                });
+            }
+        });
+    }
+
+
+    public static void deleteDirectory(ChannelSftp sftpChannel, String path) throws SftpException {
+        Vector<ChannelSftp.LsEntry> list = sftpChannel.ls(path);
+
+        for (ChannelSftp.LsEntry entry : list) {
+            String fileName = entry.getFilename();
+            if (".".equals(fileName) || "..".equals(fileName)) {
+                continue;
+            }
+            String fullPath = path + "/" + fileName;
+
+            if (entry.getAttrs().isDir()) {
+                // Recursively delete subdirectory
+                deleteDirectory(sftpChannel, fullPath);
+            } else {
+                // Delete file
+                sftpChannel.rm(fullPath);
+            }
+        }
+
+        // Delete the directory itself
+        sftpChannel.rmdir(path);
+    }
+
+    public void RenameFile(File oldPath, String newFileName, Context context) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        String newPath = oldPath.getParent() + "/" + newFileName;
+        Log.d("TAAG", "renameFile " + oldPath.getPath() + " => " + newPath);
+        final boolean[] status = {false};
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    initSession(context);
+                    sftpChannel.rename(oldPath.getPath(), newPath);
+                    status[0] = true;
+                } catch (Exception e) {
+                    Log.e("TAAG", "SFTPRename Failed to rename: " + e.getMessage());
+                } finally {
+                    closeSession();
+                }
+                ListFiles(context);
+
+                if (status[0]) {
+                    Log.d("TAAG", "SFTPrenamefile completed");
+                } else {
+
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            classUtils.messageDialog("ALERT", "Rename File Error ", context);
+
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    public void searchFiles(String searchText, Context context) {
+        Log.d("TAAG", "searchFile() " + cheminCourant + " " + searchText);
+        final String remoteDir;
+        if (cheminCourant.startsWith("sftp")) {
+            remoteDir = cheminCourant.split(":")[1];
+        } else {
+            remoteDir = cheminCourant;
+        }
+
+        fileInfoList.clear();
+        // Handler handler = new Handler(Looper.getMainLooper());
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                progress.setVisibility(View.VISIBLE);
+            }
+        });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        final boolean[] status = {false};
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    initSession(context);
+                    searchFilesRecursive(sftpChannel, remoteDir, searchText, context);
+                    status[0] = true;
+                } catch (Exception e) {
+                    Log.e("TAAG", "SFTPSearch Failed: " + e.getMessage());
+                    status[0] = false;
+                } finally {
+                    closeSession();
+                }
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        sortFileInfo();
+                        progress.setVisibility(View.GONE);
+                        adapter.notifyDataSetChanged();
+                        if (status[0]) {
+                            Log.d("TAAG", "SFTPSearch completed");
+                        } else {
+                            classUtils.messageDialog("ALERT", "Search Error ", context);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private void searchFilesRecursive(ChannelSftp sftpChannel, String remoteDir, String searchText, Context context) throws SftpException {
+        Log.d("TAAG", "SFTP searchFilesRecursive " + remoteDir);
+        Vector<ChannelSftp.LsEntry> files = sftpChannel.ls(remoteDir);
+        for (ChannelSftp.LsEntry entry : files) {
+            String fileName = entry.getFilename();
+            if (fileName.equals(".") || fileName.equals("..")) continue;
+            String filePath = remoteDir + "/" + fileName;
+            if (entry.getAttrs().isDir()) {
+                searchFilesRecursive(sftpChannel, filePath, searchText, context);
+            } else {
+                if (fileName.toLowerCase().contains(searchText.toLowerCase())) {
+                    long fileSize = entry.getAttrs().getSize();
+                    String type = "sftpfile";
+                    long lastModified = entry.getAttrs().getMTime() * 1000L;
+                    String comment = "";
+                    FileExplorerM.FileInfo fileInfo = new FileExplorerM.FileInfo(fileName, comment, lastModified, fileSize, filePath, type);
+                    fileInfoList.add(fileInfo);
+                }
+            }
+        }
+    }
+
+    public static void CreateFolder(String newName, Context context) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        String newPath = cheminCourant.split(":")[1] + "/" + newName;
+        // Handler handler = new Handler(Looper.getMainLooper());
+        Log.d("TAAG", "CreateFolder " + newPath);
+        final boolean[] status = {false};
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    initSession(context);
+                    sftpChannel.mkdir(newPath);
+                    status[0] = true;
+                } catch (Exception e) {
+                    Log.e("TAAG", "CreateFolder Failed to rename: " + e.getMessage());
+                } finally {
+                    closeSession();
+                }
+                ListFiles(context);
+                if (status[0]) {
+                    Log.d("TAAG", "CreateFolder completed");
+                } else {
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            classUtils.messageDialog("ALERT", "Create Folder Error ", context);
+
+                        }
+                    });
+                }
+
+            }
+        });
+    }
+
+    public static void CreateText(String data, String newName, Context context) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        String newPath = cheminCourant.split(":")[1] + "/" + newName;
+        // Handler handler = new Handler(Looper.getMainLooper());
+        Log.d("TAAG", "CreateText " + newPath);
+        final boolean[] status = {false};
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    initSession(context);
+                    InputStream inputStream = new ByteArrayInputStream(data.getBytes());
+                    sftpChannel.put(inputStream, newPath);
+                    status[0] = true;
+                } catch (Exception e) {
+                    Log.e("TAAG", "CreateText Failed to rename: " + e.getMessage());
+                } finally {
+                    closeSession();
+                }
+                ListFiles(context);
+                if (status[0]) {
+                    Log.d("TAAG", "CreateText completed");
+                } else {
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            classUtils.messageDialog("ALERT", "Create Text Error ", context);
+
+                        }
+                    });
+                }
+
+            }
+        });
+    }
+
+    public static String ReadFile(String filePath, Context context) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+
+        Log.d("TAAG", "ReadFile " + filePath);
+
+        Future<String> future = executor.submit(new Callable<String>() {
+            @Override
+            public String call() {
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                try {
+                    initSession(context);
+                    sftpChannel.get(filePath, outputStream);
+                    return outputStream.toString();
+                } catch (Exception e) {
+                    Log.e("TAAG", "ReadFile Failed: " + e.getMessage());
+                    return null;
+                } finally {
+                    closeSession();
+                }
+            }
+        });
+
+        try {
+            return future.get();
+        } catch (InterruptedException | ExecutionException e) {
+            Log.e("TAAG", "ReadFile execution failed: " + e.getMessage());
+            return null;
+        } finally {
+            executor.shutdown();
+        }
+    }
+
+
+    public void copy(ArrayList<String> copyList) {
+        for (String s : copyList) {
+            //      copyFile(new File(s), new File(cheminCourant));
+        }
+    }
+
+    public void cut(ArrayList<String> cutList) {
+
+        for (String s : cutList) {
+//            if (copyFile(new File(s), new File(cheminCourant))) {
+//                try {
+//                    SecureDelete.deleteFile(new File(s));
+//                } catch (IOException e) {
+//                    throw new RuntimeException(e);
+//                }
+//            }
+        }
+
+
+    }
+
+
+    public static void ListFiles(final Context context) {
+        String remoteDir = cheminCourant;
+        if (remoteDir.startsWith("sftp")) {
+            remoteDir = remoteDir.split(":")[1];
+        }
+        Log.d("TAAG", "SFTP listFiles " + remoteDir);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        // Handler handler = new Handler(Looper.getMainLooper());
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                progress.setVisibility(View.VISIBLE);
+            }
+        });
+        String finalRemoteDir = remoteDir;
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                //  ArrayList<FileExplorerM.FileInfo> fileList = new ArrayList<>();
+                try {
+                    initSession(context);
+                    Vector<ChannelSftp.LsEntry> files = sftpChannel.ls(finalRemoteDir);
+
+                    fileInfoList.clear();
+                    for (ChannelSftp.LsEntry entry : files) {
+                        String fileName = entry.getFilename();
+                        if (fileName.equals(".") || fileName.equals("..")) continue;
+                        if (hideFile && fileName.startsWith(".")) continue;
+
+                        long fileSize;
+                        String filePath = finalRemoteDir + "/" + fileName;
+
+                        String type;
+                        if (entry.getAttrs().isDir()) {
+                            fileSize = -1;
+                            type = "sftpdir";
+                        } else {
+                            fileSize = entry.getAttrs().getSize();
+                            type = "sftpfile";
+                        }
+
+                        long lastModified = entry.getAttrs().getMTime() * 1000L; // Conversion en millisecondes
+                        String comment = "";
+                        FileExplorerM.FileInfo fileInfo = new FileExplorerM.FileInfo(fileName, comment, lastModified, fileSize, filePath, type);
+                        fileInfoList.add(fileInfo);
+                    }
+                } catch (Exception e) {
+                    Log.e("TAAG", "SFTPlistfiles Failed to list files: " + e.getMessage());
+                    e.printStackTrace();
+                } finally {
+                    closeSession();
+                }
+
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        sortFileInfo();
+                        progress.setVisibility(View.GONE);
+                        pathTextView.setText(cheminCourant);
+                        adapter.notifyDataSetChanged();
+
+                        Log.d("TAAG", "SFTPlistfiles File listing completed");
+
+                        // callback.onListFilesComplete(fileList);
+                    }
+                });
+            }
+        });
+    }
+
+    static void OpenFile(String remoteFilePath, Context context) {
+        Log.d("TAAG", "openFile() " + remoteFilePath);
+        if (remoteFilePath.endsWith(".txt")) {
+            String text = ReadFile(remoteFilePath, context);
+            actionCreateText(text, getPathName(remoteFilePath), context);
+            return;
+        }
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                progress.setVisibility(View.VISIBLE);
+                progressText.setText("0%");
+            }
+        });
+        String localFilePath = context.getExternalCacheDir() + "/tmp~" + new File(remoteFilePath).getName();
+        Log.d("TAAG", "openFile() " + localFilePath);
+
+        final boolean[] status = {false};
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    initSession(context);
+                    long fileSize = sftpChannel.lstat(remoteFilePath).getSize();
+                    InputStream inputStream = sftpChannel.get(remoteFilePath);
+                    FileOutputStream fos = new FileOutputStream(localFilePath);
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    long totalBytesRead = 0;
+
+                    while ((bytesRead = inputStream.read(buffer)) != -1) {
+                        fos.write(buffer, 0, bytesRead);
+                        totalBytesRead += bytesRead;
+                        final int progress = (int) ((totalBytesRead * 100) / fileSize);
+
+                        handler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                progressText.setText(progress + "%");
+                            }
+                        });
+                    }
+
+                    fos.close();
+                    inputStream.close();
+                    status[0] = true;
+                } catch (Exception e) {
+                    Log.e("TAAG", "SFTPDownload Failed to download: " + e.getMessage());
+                } finally {
+                    closeSession();
+                }
+
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        progress.setVisibility(View.GONE);
+                        progressText.setText("");
+                        Log.d("TAAG", "SFTPDownload Download completed");
+                        if (status[0]) {
+                            File file = new File(localFilePath);
+
+                            tmpFileName = file;
+                            Context applicationContext = context.getApplicationContext();
+                            Uri contentUri = FileProvider.getUriForFile(applicationContext.getApplicationContext(), applicationContext.getPackageName() + ".fileprovider", file);
+                            Intent intent = new Intent(Intent.ACTION_VIEW);
+                            intent.setData(contentUri);
+                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                            intent.putExtra("filePath", localFilePath);
+                            if (intent.resolveActivity(applicationContext.getPackageManager()) != null) {
+                                openFileLauncher.launch(intent);
+                            }
+
+                        }
+                    }
+                });
+            }
+        });
+
+    }
+
+    public static void DownloadFile(final Context context, final String remoteFilePath, final String localFilePath) {
+        Log.d("TAAG", "downloadFile " + remoteFilePath + " => " + localFilePath);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                progress.setVisibility(View.VISIBLE);
+                progressText.setText("0%");
+
+            }
+        });
+
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    initSession(context);
+                    long fileSize = sftpChannel.lstat(remoteFilePath).getSize();
+                    InputStream inputStream = sftpChannel.get(remoteFilePath);
+                    FileOutputStream fos = new FileOutputStream(localFilePath);
+
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    long totalBytesRead = 0;
+
+                    while ((bytesRead = inputStream.read(buffer)) != -1) {
+                        fos.write(buffer, 0, bytesRead);
+                        totalBytesRead += bytesRead;
+                        final int progress = (int) ((totalBytesRead * 100) / fileSize);
+
+                        handler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                progressText.setText(progress + "%");
+                            }
+                        });
+                    }
+
+                    fos.close();
+                    inputStream.close();
+                } catch (Exception e) {
+                    Log.e("TAAG", "SFTPDownload Failed to download: " + e.getMessage());
+                    e.printStackTrace();
+                } finally {
+                    closeSession();
+                }
+
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        progress.setVisibility(View.GONE);
+                        progressText.setText("");
+                        Log.d("TAAG", "SFTPDownload Download completed");
+
+                      actionRefresh(context);
+                    }
+                });
+            }
+        });
+
+    }
+
+
+    public void Command(final Context context, final String command) {
+        Log.d("TAAG", "executeCommand: " + command + " on host: " + host);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        // Handler handler = new Handler(Looper.getMainLooper());
+
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                progress.setVisibility(View.VISIBLE);
+                progressText.setText("Executing command...");
+            }
+        });
+
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                JSch jsch = new JSch();
+                Session session = null;
+                ChannelExec channelExec = null;
+
+                try {
+                    session = jsch.getSession(user, host, 22);
+                    session.setPassword(password);
+                    session.setConfig("StrictHostKeyChecking", "no");
+                    session.connect();
+
+                    channelExec = (ChannelExec) session.openChannel("exec");
+                    channelExec.setCommand(command);
+                    channelExec.setErrStream(System.err);
+
+                    InputStream in = channelExec.getInputStream();
+                    channelExec.connect();
+
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        Log.d("TAAG", "Output: " + line);
+                    }
+                    reader.close();
+
+                } catch (Exception e) {
+                    Log.e("TAAG", "SFTPCommandExecutor Failed to execute command: " + e.getMessage());
+                    e.printStackTrace();
+                } finally {
+                    if (channelExec != null) {
+                        channelExec.disconnect();
+                    }
+                    if (session != null) {
+                        session.disconnect();
+                    }
+                }
+
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        progress.setVisibility(View.GONE);
+                        progressText.setText("");
+                        Log.d("TAAG", "SFTPCommandExecutor Command execution completed");
+                        //callback.onCommandComplete();
+                    }
+                });
+            }
+        });
+    }
+
+
+    public void uploadFile(final Context context, final String localFilePath, final String remoteFilePath) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        // Handler handler = new Handler(Looper.getMainLooper());
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+
+                progress.setVisibility(View.VISIBLE);
+            }
+        });
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    initSession(context);
+                    FileInputStream fis = new FileInputStream(localFilePath);
+                    sftpChannel.put(fis, remoteFilePath);
+                    fis.close();
+                } catch (Exception e) {
+                    Log.e("TAAG", "SFTPUpload Failed to upload: " + e.getMessage());
+                    e.printStackTrace();
+                } finally {
+                    closeSession();
+                }
+
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+
+                        progress.setVisibility(View.GONE);
+                        Log.d("TAAG", "SFTPUpload Upload completed");
+                        //callback.onUploadFilesComplete();
+                    }
+                });
+            }
+        });
+    }
+
+
+}
